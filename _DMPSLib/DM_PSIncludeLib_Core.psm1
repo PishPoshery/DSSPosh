@@ -41,6 +41,11 @@
 #                   Updated Get-DMScriptDir & Get-DMScriptName to persist value after running from within a script.
 #  060116 DSS V1.11 Added function Split-DMArray
 #  101717 DSS V1.12 Added functions Get-DMCName, Get-DMMSIDsAssignedToEmpID and Get-DMEmpIDFromName
+#  041218 DSS V1.13 Fixed bug with Get-DMCName handling of embedded "DC" in OU or domain name
+#  042318 DSS V1.14 Optimized speed of Get-DMUserLogonSessionData with a hash table
+#  050718 DSS V1.15 Fixed bug in Get-DMUserLogonSessionData where LogonUser was not being returned
+#  051118 DSS V1.16 Added functions Get-DMADComputersFromNameList, Get-DMComputers_RecentlyLoggedInWorkstations and Get-Computers_CitrixSvrs
+#  053118 DSS V1.17 Added functions Convert-DMCNtoDN, New-DMADOUTree, Copy-DMGPOLinks
 #############################################################################################################################################
 
 Function Split-DMArray {
@@ -83,16 +88,36 @@ Function Get-DMCName {
 param([string]$DN) 
   $Parts=$DN.Split(",") 
   $NumParts=$Parts.Count 
-  $FQDNPieces=($Parts -match 'DC').Count 
+  $FQDNPieces=($Parts -match 'DC=').Count 
   $Middle=$NumParts-$FQDNPieces 
   foreach ($x in ($Middle+1)..($NumParts)) { 
     $CN+=$Parts[$x-1].SubString(3)+'.' 
     } 
-  $CN=$CN.substring(0,($CN.length)-1) 
-  foreach ($x in ($Middle-1)..0) {  
-    $CN+="/"+$Parts[$x].SubString(3) 
-   } 
+  $CN=$CN.substring(0,($CN.length)-1)
+  If ($Middle -gt 0) {
+    foreach ($x in ($Middle-1)..0) {  
+      $CN+="/"+$Parts[$x].SubString(3) 
+     }
+   }
 Return $CN 
+} 
+
+Function Convert-DMCNtoDN { 
+<#
+.SYNOPSIS
+  Converts an AD Canonical Name to a Distinguished Name 
+.DESCRIPTION
+ 
+.NOTES
+.EXAMPLE
+#>
+ [CmdletBinding()]
+ Param (
+   [Parameter(mandatory=$True,ValueFromPipeline=$True)]
+   [String]$OUCN
+  )
+  $Parts=$OUCN.Split("/") 
+  Return "$(($Parts[$($Parts.Count)..1] | foreach {"OU=$_"}) -join ","),$(($Parts[0].Split(".") | foreach {"DC=$_"}) -join ",")"
 } 
 
 Function Get-DMMSIDsAssignedToEmpID ($EmpID) {
@@ -321,6 +346,194 @@ process{
  }
 }
 
+Function Get-DMComputersLoggedIntoCurrently {
+[CmdLetBinding()]
+  param (
+   [Parameter(Mandatory = $False, Position = 0, ValueFromPipeline = $true)]
+	[String]$MSID = "$env:UserName"
+   )
+
+$SQLQuery = @'
+select lon.LSGUID, lon.PCName, lon.dtadded, lof.dtadded, lon.UserID, lon.legacyLS, lon.LSDuration, lof.iLSFullDuration
+from tbllogondata_hist lon 
+left outer join tbllogoffdata_hist lof on lon.lsguid = lof.lsguid
+where lon.UserId = '
+'@ + $MSID + @'
+' and lon.dtadded >= dateadd(month,-1,getdate())
+and (LegacyLS not like '/NoLSA' or LegacyLS is null)
+Order by PCNAme,lon.dtadded,UserID
+'@
+$SQLResults = Get-DMSQLQuery -SQLServer DMI-SQL-Prod -SQLDBName UHTLogonScripts -SQLQuery $SQLQuery
+$arrPCsStillLoggedIntoFromLSDB = $SQLResults  | group  pcname |
+   select @{Name = "MSID";expression = {$_.group[-1].UserID}},
+          @{Name = "ComputerName";expression = {$_.Name}},
+          @{Name = "LastLogonDate";expression = {$_.group[-1].dtadded}} |
+    select *, @{Name = "ConfirmationResults"; Expression={
+       try {
+         $ErrorActionPreference = "Stop"
+         $DMUserLogonSessionData = Get-DMUserLogonSessionData -ComputerName $_.ComputerName
+         $LogonTypes = (($DMUserLogonSessionData | ? {$_.LogonUser -eq "MS\$MSID"}).LogonTypeName | sort -Unique) -join " & "
+         If ($LogonTypes) {"LoggedIn with LogonType: $LogonTypes"} Else {"NotLoggedIn"}
+        } Catch {
+         "Device Unreachable"
+        } Finally {
+         $ErrorActionPreference = "Continue"
+        }
+      }
+    }
+ Return $arrPCsStillLoggedIntoFromLSDB
+}
+
+Function Get-DMADComputersFromNameList {
+ Param (
+    [Parameter(Mandatory = $True, Position = 0)]
+    [array]$ComputerNames)
+  # Load Sample PCs from LogonData
+  $strADFilter = '(name -eq "' + ($ComputerNames -join '") -or (name -eq "') + '")'
+  $fltScriptBlock = [scriptblock]::create($strADFilter)
+  Get-ADComputer -filter $fltScriptBlock -Properties LastLogonDate,whencreated,operatingsystem |
+                           select *,
+                                  @{name="DaysSinceLastLogon";Expression={"{0:N1}" -f ((get-date) - (get-date($_.LastLogonDate))).TotalDays}},
+                                  @{name="ServerOfflineForMoreThan14days";Expression={((get-date) - (get-date($_.LastLogonDate))).TotalDays -gt 14}},
+                                  @{name="OUCN";Expression={Get-DMCName $($_.distinguishedName.substring($_.distinguishedName.IndexOf(",")+1))}},
+                                  @{name="OU";Expression={(($_.DistinguishedName).split(","))[1..999] -join ","}}
+}
+
+Function New-DMADOUTree {
+param (
+    [Parameter(Mandatory = $True, Position = 0)]
+    [string] $OU,
+    [Parameter(Mandatory = $False, Position = 1)]
+    [string] $DC = (Get-ADDomainController).HostName
+    )
+
+  #Create the OU if it doesn't Exist
+  If (-Not $([adsi]::Exists("LDAP://$DC/$OU"))) {
+    $OUName = (($OU -split ",")[0] -split "=")[1]
+    $OUPath = (($OU -split ",")[1..9999]) -join ","
+    #If the ParentOU doesn't exist
+    If (-Not $([adsi]::Exists("LDAP://$DC/$OUPath"))) {
+      New-DMADOUTree -OU $OUPath -DC $DC
+     } 
+    Write-DMLog "Creating OU: $(Get-DMCName -DN $OU)"
+    New-ADOrganizationalUnit -Name $OUName -Path $OUPath -ProtectedFromAccidentalDeletion $False -Server $DC
+   }Else{
+    "Found Existing OU: $OU"
+   }
+ }
+
+Function Copy-DMGPOLinks {
+param (
+    [Parameter(Mandatory = $True, Position = 0)]
+    [string] $SourceOU,
+    [Parameter(Mandatory = $True, Position = 1)]
+    [string] $TargetOU,
+    [Parameter(Mandatory = $False, Position = 2)]
+    [switch] $KeepExistingTargetLinks
+   )
+
+  # Get the linked GPOs 
+  $arrLinks = (Get-GPInheritance -Target $SourceOU -Server $DC).gpolinks | sort Order
+
+  #If the Source OU has any GPOs linked to it
+  If ($arrLinks) {
+    #Create the AD OU and parent OU in needed
+    New-DMADOUTree -OU $TargetOU -DC $((Get-ADDomainController).HostName)
+
+    Write-DMLog "Adding $(($arrLinks).Count) GPOLinks to OU: $(Get-DMCName -DN $TargetOU)"
+    #Create hash mapping $True to "Yes" and $False to "No" for LinkEnabled parameter
+    $hshTrueFalse2YesNo = @{$True="Yes";$False="No"}
+
+    #Loop through each GPO and link it to the target 
+    $LoopStart = get-date
+    foreach ($Link in $arrLinks) {
+      Write-DMLog "Link Order: $(($Link).Order)"
+      Write-DMLog "  Original GPO: $(($Link).DisplayName)$NBTMsg"
+      If ($arrGPOPrepWork."Original GPO" -contains $Link.DisplayName) {
+        $NBTGPOName = $hshOriginGPONameToPrepGPOInfo[$Link.DisplayName]."New GPO"
+        $GUID = $hshNameToGPO[$NBTGPOName].ID
+        Write-DMLog "       NBT GPO: $NBTGPOName"
+       } Else {
+        $GUID = $Link.GPOId
+        $NBTMsg = ""
+       }
+
+      # Create the link and set the Link Order on the target 
+      $blnDoneTryingToLinkGPO = $False
+      $i=0
+      $MaxWait = 30
+      Do {
+        Try {
+         $GPLinkRtn = New-GPLink -Guid $GUID -Target $TargetOU -Server $DC -Confirm:$false -LinkEnabled $hshTrueFalse2YesNo[$Link.Enabled] -ErrorAction SilentlyContinue
+         $blnDoneTryingToLinkGPO = $True
+        } Catch {
+         IF ($Error[0].Exception.Message | where {$_ -like "*is already linked*"}) {
+           Write-DMLog "  GPO already linked. Skipping"
+           $blnDoneTryingToLinkGPO = $True
+          } Else {
+           $i++
+           $PercentComplete = [Math]::Round(($i/$MaxWait)*100,1)
+           $ElapsedSecondsSoFar = $i*5
+           $CalcTotalSeconds = [Math]::Round($ElapsedSecondsSoFar/($PercentComplete/100),1)
+           If ($PercentComplete -gt 10) {$SecondsRemaining = [Math]::Round($CalcTotalSeconds - $ElapsedSecondsSoFar,1)} Else {$SecondsRemaining = -1}
+           Write-Progress -Activity  "Warning: Failed to Link GPO to OU. Waiting upto $(5*$MaxWait) seconds"  -ID 2 -PercentComplete $PercentComplete -SecondsRemaining $SecondsRemaining -ParentId 1
+           Start-Sleep -Seconds 5
+           If ($i -ge $MaxWait) {$blnDoneTryingToLinkGPO = $True}
+         }
+        }
+      } Until ($blnDoneTryingToLinkGPO)
+      Write-Progress -Completed -Id 2 -Activity "Done"
+
+      $PercentComplete = [Math]::Round(($Link.Order/$arrLinks.count)*100,1)
+      $ElapsedSecondsSoFar = [Math]::Round(((New-Timespan -Start $LoopStart -End $(get-date)).TotalSeconds),1)
+      $CalcTotalSeconds = [Math]::Round($ElapsedSecondsSoFar/($PercentComplete/100),1)
+      If ($PercentComplete -gt 10) {$SecondsRemaining = [Math]::Round($CalcTotalSeconds - $ElapsedSecondsSoFar,1)} Else {$SecondsRemaining = -1}
+      Write-Progress -Activity  "OU: $(Get-DMCName -DN $SourceOU) - Order: $(($Link).Order) - Adding GPO: $(($Link).DisplayName) - ElapsedSecondsSoFar: $ElapsedSecondsSoFar"  -ID 1 -PercentComplete $PercentComplete -SecondsRemaining $SecondsRemaining
+     }
+    Write-Progress -Completed -Id 1 -Activity "Done"
+   }
+ }
+
+Function Get-DMLSDBRecords {
+ Param ([Int]$Count = 100,
+        [string]$ReturnedAttributes = "Logon_ID,PCName,UserID,dtadded,dtsubmitted,OS,Domain,LegacyLS,LSGUID",
+        [string]$WhereClause = "where OS not like '%SVR%'and sessionmode <> 'VPN' and Domain = 'MS'"
+ )
+  # Load Sample PCs from LogonData
+  $SQLQuery = "SELECT top $Count $ReturnedAttributes FROM [dbo].[tblLogonData_Hist] $WhereClause Order by Logon_ID desc"
+  Get-DMSQLQuery -SQLServer DMI-SQL-Prod -SQLDBName UHTLogonScripts -SQLQuery $SQLQuery | select -First $Count
+}
+
+Function Get-DMComputers_RecentlyLoggedInWorkstations {
+ Param ([Int]$Count = 100)
+  # Load Sample PCs from LogonData
+  $SQLQuery = "SELECT top $($Count*2) PCName FROM [dbo].[tblLogonData_Hist] where OS not like '%SVR%'and sessionmode <> 'VPN' and Domain = 'MS' Order by Logon_ID desc"
+  $arrNames = (Get-DMSQLQuery -SQLServer DMI-SQL-Prod -SQLDBName UHTLogonScripts -SQLQuery $SQLQuery).PCName | Select -Unique| select -First $Count| sort
+  Get-DMADComputersFromNameList -ComputerNames $arrNames
+}
+
+Function Get-Computers_CitrixSvrs {
+#########################################################
+# Get Citrix Server Info from AD
+#########################################################
+  $arrOUs = "OU=VDS,OU=Servers,OU=UHT,OU=UHG,DC=ms,DC=ds,DC=uhc,DC=com",
+            "OU=AppSense,OU=Servers,OU=UHT,OU=UHG,DC=ms,DC=ds,DC=uhc,DC=com",
+            "OU=Citrix,OU=Servers,OU=UHT,OU=UHG,DC=ms,DC=ds,DC=uhc,DC=com"
+  #Getting Computer Array from AD
+  $arrObjADCitrixSvrs = @()
+  ForEach ($OU in $arrOUs) {
+    Write-DMLog -Text "Getting AD Computer info for Citrix Servers in OU: $OU"
+    $arrObjADCitrixSvrs += Get-ADComputer -filter * -Properties LastLogonDate,whencreated,operatingsystem -SearchScope Subtree -SearchBase $OU |
+                           select *,
+                                  @{name="DaysSinceLastLogon";Expression={"{0:N1}" -f ((get-date) - (get-date($_.LastLogonDate))).TotalDays}},
+                                  @{name="ServerOfflineForMoreThan14days";Expression={((get-date) - (get-date($_.LastLogonDate))).TotalDays -gt 14}},
+                                  @{name="OUCN";Expression={Get-DMCName $($_.distinguishedName.substring($_.distinguishedName.IndexOf(",")+1))}}
+   }
+  $arrActiveCitrixServers = $arrObjADCitrixSvrs | where {$_.Name -and -not $_.ServerOfflineForMoreThan14days} | sort Name
+  Write-DMLog -Text "Number of AD Computer objects found in Citrix OUs: $(($arrObjADCitrixSvrs).count) / Active Servers: $(($arrActiveCitrixServers).count)"
+  Return $arrActiveCitrixServers
+ }
+
 Function Run-DMElevated {   
    <#
     .Synopsis
@@ -329,7 +542,7 @@ Function Run-DMElevated {
       The newly create process elevates the script passed in -ScriptFileToElevate parameter if specified, otherwise the calling script is elevated in the new process.
       Note:
        * The script to be elevated must be on the local drive (I haven't found a trust configuration that allows network drives yet)
-       * To retreive an ExitCode from the called script, the script must explicitly return a numeric exit code using a syntax like the one below:
+       * To retrieve an ExitCode from the called script, the script must explicitly return a numeric exit code using a syntax like the one below:
           [Environment]::Exit(1234)
          If the script explicitly Exits with an Exitcode, the -NoExit parameter request is not honored.
     .Parameter NoExit
@@ -457,7 +670,7 @@ Function Run-DMElevated {
  [Environment]::Exit($ExitCode)
 } 
 
-function Invoke-DMExecutable {
+Function Invoke-DMExecutable {
     # Runs the specified executable and captures its exit code, stdout
     # and stderr.
     # Returns: custom object.
@@ -796,16 +1009,25 @@ Function Get-DMUserLogonSessionData {
                  }
   $arrWMILoU = get-wmiobject -class Win32_LoggedOnUser -ComputerName $ComputerName
   $arrWMILoS = get-wmiobject -class Win32_LogonSession -ComputerName $ComputerName
-  $arrLoggedOnUserSessions = $arrWMILoU |
-    select @{name="ComputerName";expression={$_.__Server}}, `
-    @{name="LogonUser";expression={$arrTemp=($_.Antecedent -split '"');"$($ArrTemp[1])\$($ArrTemp[3])"}}, `
-    @{name="LogonTypeCode";expression={$LoUID=($_.Dependent -split '"')[1];($arrWMILoS|?{$_.LogonID -eq $LoUID}).LogonType}}, `
-    @{name="LogonTypeName";expression={$LoUID=($_.Dependent -split '"')[1];$hshLogonType.[int](($arrWMILoS|?{$_.LogonID -eq $LoUID}).LogonType)}}, `
-    @{name="AuthenticationPackage";expression={$LoUID=($_.Dependent -split '"')[1];($arrWMILoS|?{$_.LogonID -eq $LoUID}).AuthenticationPackage}}, `
-    @{name="StartTime";expression={$LoUID=($_.Dependent -split '"')[1];[System.Management.ManagementDateTimeconverter]::ToDateTime(($arrWMILoS|?{$_.LogonID -eq $LoUID}).StartTime)}}, `
-    @{name="LogonID";expression={($_.Dependent -split '"')[1]}}
 
-  Return $arrLoggedOnUserSessions | sort StartTime
+  #Create hash of ComputerName AD Computer Info for faster lookup later
+  $hshWMILoS = $arrWMILoS | Foreach -Begin {$hash = @{}} -Process {$hash[$_.LogonID] = $_} -End {Return $hash}
+
+  #Join WMI LoggedOn User with Logon Session Records via the LogonID field
+  $arrLoggedOnUserSessions = $arrWMILoU |
+    select @{name="ComputerName";expression={$_.__Server}},
+           @{name="LogonID";expression={($_.Dependent -split '"')[1]}},
+           @{name="LogonUser";expression={$arrTemp=($_.Antecedent -split '"');"$($ArrTemp[1])\$($ArrTemp[3])"}},
+           @{name="LoUID";expression={($_.Dependent -split '"')[1]}} |
+     select *, @{name="LogonTypeCode";expression={$hshWMILoS[$_.LoUID].LogonType}},
+               @{name="AuthenticationPackage";expression={$hshWMILoS[$_.LoUID].AuthenticationPackage}},
+               @{name="StartTime";expression={[System.Management.ManagementDateTimeconverter]::ToDateTime($hshWMILoS[$_.LoUID].StartTime)}} |
+      select Computername,LogonUser,LogonTypeCode,
+              @{name="LogonTypeName";expression={$hshLogonType[[Int]($_.LogonTypeCode)]}},
+               AuthenticationPackage,StartTime,LogonID |
+       sort StartTime
+
+  Return $arrLoggedOnUserSessions
  }
 
 Function Get-DMSQLQuery {
@@ -957,6 +1179,35 @@ Function Parse-DMIniFile {
    return $ini
   }
 } 
+
+Function Reset-VMwareViewClipboard {
+$ProcName = "VMwareViewClipboard"
+#https://getadmx.com/?Category=VMware_Horizon&Policy=pcoip.adm::Configureclipboardredirection_1
+#Enable Clipboard in both directions
+New-ItemProperty HKLM:\Software\Policies\Teradici\PCoIP\pcoip_admin -Name "pcoip.server_clipboard_state" -PropertyType DWord -Value 1 -Force | Out-Null
+$proc = get-process -Name $ProcName -ErrorAction SilentlyContinue
+If ($proc) {
+  $proc | Stop-Process -Force
+  Start-Process $proc.Path
+ } Else {
+  $arrPossiblePaths = "$Env:CommonProgramFiles\VMware\Teradici PCoIP Server\VMwareViewClipboard.exe",
+                      "$Env:CommonProgramFiles\VMware\Remote Experience\VMwareViewClipboard.exe",
+                      "$Env:CommonProgramFiles\VMware\Remote Experience\x64\VMwareViewClipboard.exe"
+  Foreach ($PossiblePath in $arrPossiblePaths) {
+   If (Test-Path $PossiblePath) {
+     $ProcPath = $PossiblePath
+    }
+   If ($ProcPath) {
+     Start-Process $ProcPath
+    } Else {
+     $ProcPath = (get-childitem "$Env:CommonProgramFiles\VMware\*.exe" -recurse | where {$_.Name -eq "VMwareViewClipboard.exe"}).fullName
+     If ($ProcPath) {
+       Start-Process $ProcPath
+      }
+    }
+  }
+ }
+ }
 
 Function Write-DMLog {
    <#
@@ -1957,30 +2208,32 @@ Function Invoke-DMMultiThreadingEngine {
  Write-DMLog -Text ("Invoke-DMMultiThreadingEngine():   Processing Rate {0:N1} (Records/minute)" -f $ProcessingRate)
  Write-DMLog -Text ("Invoke-DMMultiThreadingEngine():   Total Time to complete {0:N2} (Minutes)" -f $ElapsedMins)
  Write-DMLog -Text "Invoke-DMMultiThreadingEngine():   Number of Records to Process  : {$MaxRecordNum}"
- Write-DMLog -Text "Invoke-DMMultiThreadingEngine():   Number of Records Returned    : {$(($arrobjResults).count)}"
- Write-DMLog -Text "Invoke-DMMultiThreadingEngine():   Number of Records Failed      : {$(($arrFailedRcds).count)}"
- Write-DMLog -Text "Invoke-DMMultiThreadingEngine():   Number of Records Hung/Killed : {$(($arrHungRcds).count)}"
- Write-DMLog -Text "Invoke-DMMultiThreadingEngine():   Number of Job Errors          : {$(($arrObjJobFailureErrors).count)}"
+ Write-DMLog -Text "Invoke-DMMultiThreadingEngine():   Number of Records Returned    : {$((@($arrobjResults)).count)}"
+ Write-DMLog -Text "Invoke-DMMultiThreadingEngine():   Number of Records Failed      : {$((@($arrFailedRcds)).count)}"
+ Write-DMLog -Text "Invoke-DMMultiThreadingEngine():   Number of Records Hung/Killed : {$((@($arrHungRcds)).count)}"
+ Write-DMLog -Text "Invoke-DMMultiThreadingEngine():   Number of Job Errors          : {$((@($arrObjJobFailureErrors)).count)}"
  Write-DMLog -Text "Invoke-DMMultiThreadingEngine():   Log File : {$MTLogFile}"
  Write-DMLog -Text "Invoke-DMMultiThreadingEngine(): ########################################################################"
 
  #Create Stats object to return
- $objFcnStats = new-object PSObject
- $objFcnStats | add-member -membertype NoteProperty -name "StartTime" -Value $MTStartTime
- $objFcnStats | add-member -membertype NoteProperty -name "EndTime" -Value $MTEndTime
- $objFcnStats | add-member -membertype NoteProperty -name "ElapsedMins" -Value $ElapsedMins
- $objFcnStats | add-member -membertype NoteProperty -name "LogFile" -Value $MTLogFile
- $objFcnStats | add-member -membertype NoteProperty -name "MaxRecordNum" -Value $MaxRecordNum
- $objFcnStats | add-member -membertype NoteProperty -name "ResultsDir" -Value $ResultsDir
- $objFcnStats | add-member -membertype NoteProperty -name "NameQualifier" -Value $NameQualifier
- $objFcnStats | add-member -membertype NoteProperty -name "MaxThreads" -Value $MaxThreads
- $objFcnStats | add-member -membertype NoteProperty -name "BatchSaveSize" -Value $BatchSaveSize
- $objFcnStats | add-member -membertype NoteProperty -name "RunJobsOnRemoteComputers" -Value $RunJobsOnRemoteComputers
- $objFcnStats | add-member -membertype NoteProperty -name "HungJobThresholdinSeconds" -Value $HungJobThresholdinSeconds
- $objFcnStats | add-member -membertype NoteProperty -name "MaxJobFailuresPerRecordAllowed" -Value $MaxJobFailuresPerRecordAllowed
- $objFcnStats | add-member -membertype NoteProperty -name "RecordsPerMinuteProcessed" -Value $ProcessingRate
- $objFcnStats | add-member -membertype NoteProperty -name "ReturnedErrorCode" -Value $ReturnedErrorCode
- $objFcnStats | add-member -membertype NoteProperty -name "ReturnedErrorMsg" -Value $ReturnedErrorMsg
+  #Create ordered Hash Table to Splat into New Object to return
+  $hsh = [ordered]@{StartTime      = $MTStartTime
+                    EndTime        = $MTEndTime
+                    ElapsedMins    = $ElapsedMins
+                    LogFile        = $MTLogFile
+                    MaxRecordNum   = $MaxRecordNum
+                    ResultsDir     = $ResultsDir
+                    NameQualifier  = $NameQualifier
+                    MaxThreads     = $MaxThreads
+                    BatchSaveSize  = $BatchSaveSize
+                    RunJobsOnRemoteComputers       = $RunJobsOnRemoteComputers
+                    HungJobThresholdinSeconds      = $HungJobThresholdinSeconds
+                    MaxJobFailuresPerRecordAllowed = $MaxJobFailuresPerRecordAllowed
+                    RecordsPerMinuteProcessed      = $ProcessingRate
+                    ReturnedErrorCode              = $ReturnedErrorCode
+                    ReturnedErrorMsg               = $ReturnedErrorMsg
+                   }
+  $objFcnStats = New-Object -TypeName PSObject -Property $hsh
 
  #If we had any Job failure error
  If ($arrObjJobFailureErrors.count -gt 0) {
